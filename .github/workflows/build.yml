@@ -1,0 +1,66 @@
+name: Build Linux .deb
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            ninja-build \
+            cmake \
+            pkg-config \
+            clang \
+            dpkg
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Install flutter_distributor
+        run: |
+          dart pub global activate flutter_distributor
+          echo "$HOME/.pub-cache/bin" >> $GITHUB_PATH
+
+      - name: Build .deb
+        run: flutter_distributor package --platform linux --targets deb
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fmail-linux-${{ matrix.arch }}.deb
+          path: dist/**/*.deb
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

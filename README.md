@@ -75,6 +75,136 @@ sudo apt-get install \
 
 ---
 
+## Development Setup
+
+This section walks through the full setup from zero to a running app for each platform.
+
+### Verify Flutter is working
+
+After installing Flutter, run:
+
+```bash
+flutter doctor
+```
+
+All required items for your target platform should show a green tick. Address any issues it reports before continuing.
+
+---
+
+### Linux setup (Ubuntu / Debian / Furi FLX)
+
+1. Install Flutter:
+
+   ```bash
+   sudo snap install flutter --classic
+   flutter sdk-path  # confirm install location
+   ```
+
+   Or install manually from [flutter.dev](https://flutter.dev/docs/get-started/install/linux).
+
+2. Install system dependencies:
+
+   ```bash
+   sudo apt-get update
+   sudo apt-get install \
+     libgtk-3-dev \
+     libwebkit2gtk-4.0-dev \
+     libsqlite3-dev \
+     libsecret-1-dev \
+     sqlite3 \
+     ninja-build \
+     cmake \
+     clang \
+     pkg-config
+   ```
+
+3. Clone and run:
+
+   ```bash
+   git clone https://github.com/FuriLabs/fmail.experimental.git
+   cd fmail.experimental
+   flutter pub get
+   flutter run -d linux
+   ```
+
+The app opens in a native Linux window. Import an account via Settings to start syncing email.
+
+---
+
+### Android setup
+
+1. Install Flutter — as above, or via [flutter.dev](https://flutter.dev/docs/get-started/install/linux).
+
+2. Install [Android Studio](https://developer.android.com/studio). During setup, install:
+   - Android SDK
+   - Android SDK Command-line Tools
+   - Android Emulator (optional)
+
+   Then accept SDK licenses:
+
+   ```bash
+   flutter doctor --android-licenses
+   ```
+
+3. Connect a device or start an emulator. Enable **Developer Options** and **USB Debugging** on your device, then connect via USB. Or launch an emulator from Android Studio's Device Manager.
+
+4. Clone and run:
+
+   ```bash
+   git clone https://github.com/FuriLabs/fmail.experimental.git
+   cd fmail.experimental
+   flutter pub get
+   flutter run -d android
+   ```
+
+---
+
+### iOS setup (macOS only)
+
+1. Install Flutter from [flutter.dev](https://flutter.dev/docs/get-started/install/macos).
+
+2. Install Xcode from the Mac App Store, then:
+
+   ```bash
+   sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+   sudo xcodebuild -runFirstLaunch
+   ```
+
+3. Install CocoaPods:
+
+   ```bash
+   sudo gem install cocoapods
+   ```
+
+4. Clone and run:
+
+   ```bash
+   git clone https://github.com/FuriLabs/fmail.experimental.git
+   cd fmail.experimental
+   flutter pub get
+   cd ios && pod install && cd ..
+   flutter run -d ios
+   ```
+
+A physical device requires a free or paid Apple Developer account. Simulators work without one.
+
+---
+
+### Web (quickest — any OS)
+
+No device or emulator needed. Works on any machine with Chrome installed:
+
+```bash
+git clone https://github.com/FuriLabs/fmail.experimental.git
+cd fmail.experimental
+flutter pub get
+flutter run -d chrome
+```
+
+Full UI, SQLite, and IMAP sync all work locally in the browser. Ideal for fast UI iteration without a device.
+
+---
+
 ## Furi FLX Development Setup
 
 The [Furi FLX](https://furilabs.com) runs full Linux (arm64) — not Android. fMail is installed as a `.deb` package, the same as any Linux desktop.
@@ -126,8 +256,8 @@ flutter build appbundle --release
 ## Build & Run
 
 ```bash
-git clone https://github.com/furilabs/fmail.git
-cd fmail
+git clone https://github.com/FuriLabs/fmail.experimental.git
+cd fmail.experimental
 flutter pub get
 ```
 

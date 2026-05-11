@@ -1,0 +1,30 @@
+{
+  "accounts": [
+    {
+      "imap": "imap.example.com",
+      "smtp": "smtp.example.com",
+      "caldav-base-url": "https://caldav.example.com",
+      "caldav-path": "/example.com/remote.php/dav/calendars/user/personal/",
+      "username": "user@example.com",
+      "password": "your_password_here",
+      "reply-from": "user@example.com",
+      "name": "Your Name",
+      "signature": "Regards,\nYour Name",
+      "display": "YN",
+      "color": "#9C27B0"
+    },
+    {
+      "imap": "imap.example.com",
+      "smtp": "smtp.example.com",
+      "caldav-base-url": "https://caldav.example.com",
+      "caldav-path": "/example.com/remote.php/dav/calendars/user/work/",
+      "username": "work@example.com",
+      "password": "your_password_here",
+      "reply-from": "work@example.com",
+      "name": "Your Name",
+      "signature": "Cheers,\nYour Name",
+      "display": "WK",
+      "color": "#4CAF50"
+    }
+  ]
+}

@@ -1,0 +1,3147 @@
+import 'dart:math';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:enough_mail/enough_mail.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
+import 'package:file_picker/file_picker.dart';
+import 'imap_flags_helper.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:intl/intl.dart';
+
+
+import 'email_detail_screen_test.dart'; // Import the EmailDetailScreen widget
+import 'compose_screen.dart'; // Import the ComposeScreen widget
+import 'email_filter_system.dart'; // Import the filter system
+
+// Global error handler to prevent app crashes
+void _handleError(FlutterErrorDetails details) {
+  print('UNCAUGHT ERROR: ${details.exception}');
+  print('Stack trace: ${details.stack}');
+  // Return true to prevent app from crashing
+}
+
+void main() async {
+  // Set up error handling
+  FlutterError.onError = (FlutterErrorDetails details) {
+    FlutterError.presentError(details);
+    print('Flutter error caught by global handler: ${details.exception}');
+    // Don't crash the app
+  };
+
+  // Set up error handling at the earliest possible point
+  FlutterError.onError = (FlutterErrorDetails details) {
+    print('Flutter error: ${details.exception}');
+    print('Stack trace: ${details.stack}');
+    FlutterError.dumpErrorToConsole(details);
+  };
+
+  // Catch errors that aren't caught by Flutter's error handling
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Use this instead of PlatformDispatcher
+  // This works on older Flutter versions
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    FlutterError.onError = _handleError;
+  });
+
+  if (Platform.isLinux || Platform.isWindows) {
+    try {
+      sqfliteFfiInit();
+      databaseFactory = databaseFactoryFfi;
+      print('SQLite FFI initialized successfully');
+    } catch (e) {
+      print('Failed to initialize SQLite FFI: $e');
+      print('This may be due to missing SQLite libraries on the system.');
+      // Continue without crashing - we'll handle this in DatabaseHelper
+    }
+  }
+
+  FlutterError.onError = (FlutterErrorDetails details) {
+    if (details.exception.toString().contains('Num Lock')) {
+      print("Ignoring known Flutter Linux platform issue with Num Lock key");
+    } else {
+      FlutterError.presentError(details);
+    }
+  };
+
+  try {
+    await DatabaseHelper.instance.database;
+    print('Database initialized successfully');
+  } catch (e) {
+    print('Database initialization failed: $e');
+    // Continue running the app even if database fails
+    // The app will show an error dialog to the user
+  }
+  
+  runApp(const FuriMailApp());
+}
+
+class FuriMailApp extends StatelessWidget {
+  const FuriMailApp({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'fMail',
+      theme: ThemeData(
+        primarySwatch: Colors.grey,
+        brightness: Brightness.dark,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+        dividerTheme: const DividerThemeData(
+          thickness: 1.0,
+          space: 1.0,
+        ),
+        listTileTheme: const ListTileThemeData(
+          contentPadding: EdgeInsets.symmetric(horizontal: 8.0),
+        ),
+      ),
+      home: const EmailListScreen(),
+    );
+  }
+}
+
+class EmailAccount {
+  final String imap;
+  final String smtp;
+  final String username;
+  final String password;
+  final String replyFrom;
+  final String name;
+  final String signature;
+  final Color color;
+  final String display;
+
+  EmailAccount({
+    required this.imap,
+    required this.smtp,
+    required this.username,
+    required this.password,
+    required this.replyFrom,
+    required this.name,
+    required this.signature,
+    required this.color,
+    required this.display,
+  });
+
+  factory EmailAccount.fromJson(Map<String, dynamic> json) {
+    return EmailAccount(
+      imap: json['imap'],
+      smtp: json['smtp'],
+      username: json['username'],
+      password: json['password'],
+      replyFrom: json['reply-from'],
+      name: json['name'],
+      signature: json['signature'],
+      color: Color(
+          int.parse(json['color'].substring(1, 7), radix: 16) + 0xFF000000),
+      display: json['display'],
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'imap': imap,
+      'smtp': smtp,
+      'username': username,
+      'password': password,
+      'reply-from': replyFrom,
+      'name': name,
+      'signature': signature,
+      'color':
+          '#${color.value.toRadixString(16).substring(2, 8).toUpperCase()}',
+      'display': display,
+    };
+  }
+}
+
+class DatabaseHelper {
+  static final DatabaseHelper instance = DatabaseHelper._init();
+  static Database? _database;
+  static bool _initializationFailed = false;
+  static String? _initializationError;
+
+  DatabaseHelper._init();
+
+  Future<Database> get database async {
+    if (_initializationFailed) {
+      throw Exception('Database initialization failed: $_initializationError');
+    }
+    
+    if (_database != null) return _database!;
+    
+    try {
+      _database = await _initDB('furimail.db');
+      return _database!;
+    } catch (e) {
+      _initializationFailed = true;
+      _initializationError = e.toString();
+      print('Database initialization error: $e');
+      
+      // Provide a helpful error message
+      if (e.toString().contains('libsqlite3.so')) {
+        _initializationError = 'SQLite library not found. Please install sqlite3 development libraries:\n'
+            'sudo apt install libsqlite3-dev sqlite3';
+      }
+      
+      rethrow;
+    }
+  }
+
+  Future<Database> _initDB(String filePath) async {
+    final dbPath = await getDatabasesPath();
+    final path = '$dbPath/$filePath';
+
+    return await openDatabase(
+      path,
+      version: 8,  // Increased version for IMAP folder support
+      onCreate: _createDB,
+      onUpgrade: _onUpgrade,
+    );
+  }
+
+  Future _createDB(Database db, int version) async {
+    const idType = 'INTEGER PRIMARY KEY AUTOINCREMENT';
+    const textType = 'TEXT NOT NULL';
+    const intType = 'INTEGER NOT NULL';
+
+    await db.execute('''
+CREATE TABLE emails (
+  id $idType,
+  messageId $textType,
+  accountId $textType,
+  subject $textType,
+  sender $textType,
+  senderEmail $textType,
+  timestamp $intType,
+  content $textType,
+  isRead $intType,
+  isStarred $intType,
+  isAnswered $intType DEFAULT 0,
+  isForwarded $intType DEFAULT 0,
+  isDraft $intType DEFAULT 0,
+  isDeleted $intType DEFAULT 0,
+  isJunk $intType DEFAULT 0,
+  folderPath $textType,
+  inReplyTo TEXT,
+  "references" TEXT,
+  attachments TEXT,
+  threadParentId TEXT,
+  hasAttachments $intType DEFAULT 0,
+  hasImages $intType DEFAULT 0,
+  rawEmail TEXT,
+  imapFolder TEXT
+)
+''');
+
+    await db.execute('''
+CREATE TABLE accounts (
+  id $idType,
+  imap $textType,
+  smtp $textType,
+  username $textType,
+  password $textType,
+  replyFrom $textType,
+  name $textType,
+  signature $textType,
+  color $textType,
+  display $textType
+)
+''');
+
+    await db.execute('CREATE INDEX idx_email_subject ON emails (subject)');
+    await db.execute('CREATE INDEX idx_email_sender ON emails (sender)');
+    await db.execute('CREATE INDEX idx_email_content ON emails (content)');
+    await db.execute('CREATE INDEX idx_email_timestamp ON emails (timestamp)');
+    await db.execute('CREATE INDEX idx_email_inreplyto ON emails (inReplyTo)');
+    await db
+        .execute('CREATE INDEX idx_email_references ON emails ("references")');
+    await db.execute(
+        'CREATE INDEX idx_email_threadParentId ON emails (threadParentId)');
+  }
+
+  Future _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      var tableInfo = await db.rawQuery("PRAGMA table_info(emails)");
+      var columnNames = tableInfo.map((col) => col['name'] as String).toList();
+
+      if (!columnNames.contains('inReplyTo')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN inReplyTo TEXT');
+      }
+
+      if (!columnNames.contains('references')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN "references" TEXT');
+      }
+
+      if (!columnNames.contains('attachments')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN attachments TEXT');
+      }
+
+      // Add missing boolean columns that should be in version 2
+      if (!columnNames.contains('isAnswered')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isAnswered INTEGER DEFAULT 0');
+        print('Added missing column: isAnswered');
+      }
+
+      if (!columnNames.contains('isForwarded')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isForwarded INTEGER DEFAULT 0');
+        print('Added missing column: isForwarded');
+      }
+
+      if (!columnNames.contains('isDraft')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isDraft INTEGER DEFAULT 0');
+        print('Added missing column: isDraft');
+      }
+
+      if (!columnNames.contains('isDeleted')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isDeleted INTEGER DEFAULT 0');
+        print('Added missing column: isDeleted');
+      }
+
+      if (!columnNames.contains('isJunk')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isJunk INTEGER DEFAULT 0');
+        print('Added missing column: isJunk');
+      }
+
+      try {
+        await db
+            .execute('CREATE INDEX idx_email_inreplyto ON emails (inReplyTo)');
+      } catch (e) {
+        print('Note: Index may already exist: $e');
+      }
+
+      try {
+        await db.execute(
+            'CREATE INDEX idx_email_references ON emails ("references")');
+      } catch (e) {
+        print('Note: Index may already exist: $e');
+      }
+    }
+
+    if (oldVersion < 3) {
+      var tableInfo = await db.rawQuery("PRAGMA table_info(emails)");
+      var columnNames = tableInfo.map((col) => col['name'] as String).toList();
+
+      if (!columnNames.contains('threadParentId')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN threadParentId TEXT');
+        print('Added missing column: threadParentId');
+      }
+
+      if (!columnNames.contains('hasAttachments')) {
+        await db.execute(
+            'ALTER TABLE emails ADD COLUMN hasAttachments INTEGER DEFAULT 0');
+        print('Added missing column: hasAttachments');
+      }
+
+      if (!columnNames.contains('hasImages')) {
+        await db.execute(
+            'ALTER TABLE emails ADD COLUMN hasImages INTEGER DEFAULT 0');
+        print('Added missing column: hasImages');
+      }
+
+      if (!columnNames.contains('rawEmail')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN rawEmail TEXT');
+        print('Added missing column: rawEmail');
+      }
+
+      try {
+        await db.execute(
+            'CREATE INDEX idx_email_threadParentId ON emails (threadParentId)');
+      } catch (e) {
+        print('Note: Index may already exist: $e');
+      }
+    }
+
+    if (oldVersion < 4) {
+      var tableInfo = await db.rawQuery("PRAGMA table_info(ememails)");
+      var columnNames = tableInfo.map((col) => col['name'] as String).toList();
+
+      if (!columnNames.contains('rawEmail')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN rawEmail TEXT');
+        print('Added missing column: rawEmail');
+      }
+    }
+
+    // Add a comprehensive migration to ensure all columns exist
+    if (oldVersion < 5) {
+      var tableInfo = await db.rawQuery("PRAGMA table_info(emails)");
+      var columnNames = tableInfo.map((col) => col['name'] as String).toList();
+
+      // Ensure all boolean columns exist (some might have been missed in previous versions)
+      if (!columnNames.contains('isAnswered')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isAnswered INTEGER DEFAULT 0');
+        print('Added missing column: isAnswered');
+      }
+
+      if (!columnNames.contains('isForwarded')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isForwarded INTEGER DEFAULT 0');
+        print('Added missing column: isForwarded');
+      }
+
+      if (!columnNames.contains('isDraft')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isDraft INTEGER DEFAULT 0');
+        print('Added missing column: isDraft');
+      }
+
+      if (!columnNames.contains('isDeleted')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isDeleted INTEGER DEFAULT 0');
+        print('Added missing column: isDeleted');
+      }
+
+      if (!columnNames.contains('isJunk')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN isJunk INTEGER DEFAULT 0');
+        print('Added missing column: isJunk');
+      }
+    }
+
+    if (oldVersion < 6) {
+      var tableInfo = await db.rawQuery("PRAGMA table_info(emails)");
+      var columnNames = tableInfo.map((col) => col['name'] as String).toList();
+
+      if (!columnNames.contains('customFolder')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN customFolder TEXT');
+        print('Added missing column: customFolder');
+      }
+    }
+
+    // Version 7: Final migration to ensure all columns exist
+    if (oldVersion < 7) {
+      print('Running database migration to version 7...');
+      var tableInfo = await db.rawQuery("PRAGMA table_info(emails)");
+      var columnNames = tableInfo.map((col) => col['name'] as String).toList();
+
+      // Comprehensive check for all boolean columns that might be missing
+      final requiredColumns = {
+        'isAnswered': 'ALTER TABLE emails ADD COLUMN isAnswered INTEGER DEFAULT 0',
+        'isForwarded': 'ALTER TABLE emails ADD COLUMN isForwarded INTEGER DEFAULT 0',
+        'isDraft': 'ALTER TABLE emails ADD COLUMN isDraft INTEGER DEFAULT 0',
+        'isDeleted': 'ALTER TABLE emails ADD COLUMN isDeleted INTEGER DEFAULT 0',
+        'isJunk': 'ALTER TABLE emails ADD COLUMN isJunk INTEGER DEFAULT 0',
+        'customFolder': 'ALTER TABLE emails ADD COLUMN customFolder TEXT',
+      };
+
+      for (final columnName in requiredColumns.keys) {
+        if (!columnNames.contains(columnName)) {
+          await db.execute(requiredColumns[columnName]!);
+          print('Added missing column: $columnName');
+        }
+      }
+      print('Database migration to version 7 completed.');
+    }
+
+    // Version 8: Replace customFolder with imapFolder for real IMAP folder support
+    if (oldVersion < 8) {
+      print('Running database migration to version 8...');
+      var tableInfo = await db.rawQuery("PRAGMA table_info(emails)");
+      var columnNames = tableInfo.map((col) => col['name'] as String).toList();
+
+      // Add imapFolder column
+      if (!columnNames.contains('imapFolder')) {
+        await db.execute('ALTER TABLE emails ADD COLUMN imapFolder TEXT');
+        print('Added missing column: imapFolder');
+      }
+
+      // Migrate existing customFolder data to imapFolder
+      await db.execute('UPDATE emails SET imapFolder = customFolder WHERE customFolder IS NOT NULL');
+      print('Migrated customFolder data to imapFolder');
+
+      // Drop customFolder column (SQLite doesn't support DROP COLUMN directly, so we leave it for now)
+      // In a production app, we would create a new table and migrate data
+      print('Database migration to version 8 completed.');
+    }
+  }
+
+  Future<int> insertEmail(Map<String, dynamic> email) async {
+    final db = await instance.database;
+
+    final existingEmail = await db.query(
+      'emails',
+      where: 'messageId = ? AND accountId = ?',
+      whereArgs: [email['messageId'], email['accountId']],
+      limit: 1,
+    );
+
+    if (existingEmail.isNotEmpty) {
+      return existingEmail.first['id'] as int;
+    }
+
+    email['content'] ??= '';
+    email['inReplyTo'] ??= '';
+    email['references'] ??= '';
+    email['attachments'] ??= '';
+    email['threadParentId'] ??= email['messageId'];
+    email['hasAttachments'] ??= 0;
+    email['hasImages'] ??= 0;
+    email['rawEmail'] ??= '';
+
+    try {
+      return await db.insert('emails', email);
+    } catch (e) {
+      print('Error inserting email: $e');
+      if (e.toString().contains('no column named')) {
+        print('Attempting to handle missing column...');
+        await _onUpgrade(db, 2, 3);
+        return await db.insert('emails', email);
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> updateThreadParent(String messageId, String newParentId) async {
+    final db = await instance.database;
+    await db.update(
+      'emails',
+      {'threadParentId': newParentId},
+      where: 'threadParentId = ? OR messageId = ?',
+      whereArgs: [messageId, messageId],
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> findThreadEmails({
+    required String senderEmail,
+    required String subject,
+    required String accountId,
+    String? inReplyTo,
+    String? references,
+  }) async {
+    final db = await instance.database;
+    final cleanSubject = subject
+        .replaceAll(RegExp(r'^(Re:|Fwd:)\s*', caseSensitive: false), '')
+        .trim();
+    String whereClause = 'senderEmail = ? AND accountId = ?';
+    List<String> whereArgs = [senderEmail, accountId];
+
+    if (cleanSubject.isNotEmpty) {
+      whereClause += ' AND subject LIKE ?';
+      whereArgs.add('%$cleanSubject%');
+    }
+
+    if (inReplyTo != null && inReplyTo.isNotEmpty) {
+      whereClause += ' OR inReplyTo = ?';
+      whereArgs.add(inReplyTo);
+    }
+
+    if (references != null && references.isNotEmpty) {
+      final referenceIds =
+          references.split(' ').where((id) => id.isNotEmpty).toList();
+      if (referenceIds.isNotEmpty) {
+        whereClause += ' OR "references" IN (?)';
+        whereArgs.add(referenceIds.join(','));
+      }
+    }
+
+    if (cleanSubject.isNotEmpty || inReplyTo != null || references != null) {
+      whereClause = '($whereClause)';
+    }
+
+    print('SQL Query: $whereClause');
+    print('SQL Args: $whereArgs');
+
+    return await db.query(
+      'emails',
+      where: whereClause.isEmpty ? null : whereClause,
+      whereArgs: whereArgs.isEmpty ? null : whereArgs,
+    );
+  }
+
+  Future<int> insertAccount(EmailAccount account) async {
+    final db = await instance.database;
+    const secureStorage = FlutterSecureStorage();
+    await secureStorage.write(
+        key: 'account_${account.username}_password', value: account.password);
+
+    final accountData = {
+      'imap': account.imap,
+      'smtp': account.smtp,
+      'username': account.username,
+      'replyFrom': account.replyFrom,
+      'name': account.name,
+      'signature': account.signature,
+      'color': '#${account.color.value.toRadixString(16).substring(2, 8)}',
+      'display': account.display,
+      'password': '',
+    };
+
+    return await db.insert('accounts', accountData);
+  }
+
+  Future<int> updateAccount(EmailAccount account) async {
+    final db = await instance.database;
+    const secureStorage = FlutterSecureStorage();
+    
+    // Update password in secure storage
+    await secureStorage.write(
+        key: 'account_${account.username}_password', 
+        value: account.password);
+
+    final accountData = {
+      'imap': account.imap,
+      'smtp': account.smtp,
+      'replyFrom': account.replyFrom,
+      'name': account.name,
+      'signature': account.signature,
+      'color': '#${account.color.value.toRadixString(16).substring(2, 8)}',
+      'display': account.display,
+      // Note: username is not updated as it's the primary key
+    };
+
+    return await db.update(
+      'accounts',
+      accountData,
+      where: 'username = ?',
+      whereArgs: [account.username],
+    );
+  }
+
+  Future<int> deleteAccount(String username) async {
+    final db = await instance.database;
+    const secureStorage = FlutterSecureStorage();
+    
+    // Remove password from secure storage
+    await secureStorage.delete(key: 'account_${username}_password');
+    
+    // Delete all emails for this account
+    await db.delete(
+      'emails',
+      where: 'accountId = ?',
+      whereArgs: [username],
+    );
+    
+    // Delete the account
+    return await db.delete(
+      'accounts',
+      where: 'username = ?',
+      whereArgs: [username],
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getEmails({
+    String? searchQuery,
+    int? limit,
+    int? offset,
+    EmailFilter? filter,
+  }) async {
+    final db = await instance.database;
+
+    String whereClause;
+    List<dynamic> whereArgs = [];
+
+    if (filter != null) {
+      // Use filter system to generate WHERE clause
+      whereClause = filter.generateWhereClause();
+      whereArgs = filter.generateWhereArgs();
+    } else {
+      // Fallback to old search system
+      whereClause = 'threadParentId = messageId';
+
+      if (searchQuery != null && searchQuery.isNotEmpty) {
+        whereClause += ' AND (subject LIKE ? OR sender LIKE ? OR content LIKE ?)';
+        whereArgs.addAll(['%$searchQuery%', '%$searchQuery%', '%$searchQuery%']);
+      }
+    }
+
+    return db.query(
+      'emails',
+      where: whereClause,
+      whereArgs: whereArgs.isEmpty ? null : whereArgs,
+      orderBy: 'timestamp DESC',
+      limit: limit,
+      offset: offset,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getThreadEmails(
+      String threadParentId) async {
+    final db = await instance.database;
+    return db.query(
+      'emails',
+      where: 'threadParentId = ?',
+      whereArgs: [threadParentId],
+      orderBy: 'timestamp ASC',
+    );
+  }
+
+  Future<bool> hasReplies(String threadParentId) async {
+    final db = await instance.database;
+    final result = await db.query(
+      'emails',
+      where: 'threadParentId = ? AND messageId != threadParentId',
+      whereArgs: [threadParentId],
+      limit: 1,
+    );
+    return result.isNotEmpty;
+  }
+
+  Future<List<EmailAccount>> getAccounts() async {
+    final db = await instance.database;
+    final accountsData = await db.query('accounts');
+    const secureStorage = FlutterSecureStorage();
+    List<EmailAccount> accounts = [];
+
+    for (var accountData in accountsData) {
+      final username = accountData['username'] as String;
+      String password = '';
+      try {
+        password = await secureStorage.read(
+              key: 'account_${username}_password',
+            ) ??
+            '';
+      } catch (e) {
+        print("Error retrieving password for $username: $e");
+      }
+
+      accounts.add(EmailAccount(
+        imap: accountData['imap'] as String,
+        smtp: accountData['smtp'] as String,
+        username: username,
+        password: password,
+        replyFrom: accountData['replyFrom'] as String,
+        name: accountData['name'] as String,
+        signature: accountData['signature'] as String,
+        color: Color(int.parse((accountData['color'] as String).substring(1, 7),
+                radix: 16) +
+            0xFF000000),
+        display: accountData['display'] as String,
+      ));
+    }
+    return accounts;
+  }
+
+  // IMAP Folder Management Methods
+  Future<List<String>> getImapFolders(EmailAccount account) async {
+    try {
+      final imapClient = ImapClient();
+      await imapClient.connectToServer(account.imap, 993, isSecure: true);
+      await imapClient.login(account.username, account.password);
+      
+      final mailboxes = await imapClient.listMailboxes();
+      await imapClient.logout();
+      
+      // Extract folder names and filter out special system folders
+      final folderNames = <String>[];
+      for (final mailbox in mailboxes) {
+        // Check if mailbox has noSelect flag (can't select messages from it)
+        if (mailbox.flags.contains(r'\Noselect')) {
+          continue; // Skip this mailbox
+        }
+        
+        if (mailbox.name.isNotEmpty) {
+          folderNames.add(mailbox.name);
+        }
+      }
+      
+      print('📁 Found ${folderNames.length} IMAP folders for ${account.username}: $folderNames');
+      return folderNames;
+    } catch (e) {
+      print('Error fetching IMAP folders for ${account.username}: $e');
+      return ['INBOX']; // Return at least INBOX as fallback
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getEmailsFromImapFolder({
+    required EmailAccount account,
+    required String folderName,
+    int limit = 50,
+  }) async {
+    try {
+      final imapClient = ImapClient();
+      await imapClient.connectToServer(account.imap, 993, isSecure: true);
+      await imapClient.login(account.username, account.password);
+      
+      // Select the specific folder/mailbox
+      final Mailbox mailbox;
+      if (folderName.toUpperCase() == 'INBOX') {
+        mailbox = await imapClient.selectInbox();
+      } else {
+        // For non-inbox folders, first get the list of mailboxes to find the right one
+        final mailboxes = await imapClient.listMailboxes();
+        final targetMailbox = mailboxes.firstWhere(
+          (mb) => mb.name == folderName,
+          orElse: () => throw Exception('Mailbox $folderName not found'),
+        );
+        mailbox = await imapClient.selectMailbox(targetMailbox);
+      }
+      
+      final messageCount = mailbox.messagesExists;
+      
+      if (messageCount == 0) {
+        await imapClient.logout();
+        return [];
+      }
+      
+      // Get the last 'limit' messages
+      final startIndex = messageCount > limit ? messageCount - limit + 1 : 1;
+      final sequence = MessageSequence.fromRange(
+        startIndex,
+        messageCount,
+        isUidSequence: false,
+      );
+      
+      final fetchResult = await imapClient.fetchMessages(
+        sequence,
+        'BODY[] FLAGS',
+      );
+      
+      final emails = <Map<String, dynamic>>[];
+      for (var message in fetchResult.messages) {
+        // Process message similar to existing email processing logic
+        final email = await processImapMessage(message, account, folderName);
+        if (email != null) {
+          emails.add(email);
+        }
+      }
+      
+      await imapClient.logout();
+      return emails;
+    } catch (e) {
+      print('Error fetching emails from folder $folderName: $e');
+      return [];
+    }
+  }
+
+  Future<Map<String, dynamic>?> processImapMessage(
+    MimeMessage message,
+    EmailAccount account,
+    String folderName,
+  ) async {
+    try {
+      final String messageId = message.guid?.toString() ??
+          message.uid?.toString() ??
+          'msg_${DateTime.now().millisecondsSinceEpoch}';
+
+      // Check if email already exists
+      final db = await instance.database;
+      final existingEmails = await db.query(
+        'emails',
+        where: 'messageId = ? AND accountId = ?',
+        whereArgs: [messageId, account.username],
+      );
+
+      if (existingEmails.isNotEmpty) {
+        return null; // Email already exists
+      }
+
+      final subject = message.decodeSubject() ?? 'No Subject';
+      
+      String senderName = 'Unknown';
+      String senderEmail = 'unknown@unknown.com';
+      
+      // First try to get sender from envelope.from (the actual sender)
+      if (message.envelope?.from != null &&
+          message.envelope!.from!.isNotEmpty) {
+        var sender = message.envelope!.from![0];
+        senderName = (sender.personalName?.isNotEmpty == true) ? sender.personalName! : sender.email;
+        senderEmail = sender.email;
+      }
+      
+      // If envelope.from is not available, try parsing the From header
+      if (senderEmail == 'unknown@unknown.com') {
+        final fromHeader = message.getHeaderValue('from');
+        if (fromHeader?.isNotEmpty ?? false) {
+          try {
+            var from = MailAddress.parse(fromHeader!);
+            senderName = (from.personalName?.isNotEmpty == true) ? from.personalName! : from.email;
+            senderEmail = from.email;
+          } catch (e) {
+            print("Error parsing From header: $e");
+          }
+        }
+      }
+      
+      // Final fallback: try message.from if available
+      if (senderEmail == 'unknown@unknown.com' && message.from?.isNotEmpty == true) {
+        final from = message.from!.first;
+        senderName = from.personalName ?? from.email;
+        senderEmail = from.email;
+      }
+      
+      final timestamp = message.decodeDate()?.millisecondsSinceEpoch ?? 
+          DateTime.now().millisecondsSinceEpoch;
+
+      String content = message.decodeTextHtmlPart() ?? 
+          message.decodeTextPlainPart() ?? '';
+
+      // Parse IMAP flags
+      final imapFlags = ImapFlagsHelper.parseImapFlags(message);
+
+      // Process attachments (reuse existing logic)
+      final attachments = <Map<String, dynamic>>[];
+      int hasAttachments = 0;
+      int hasImages = 0;
+
+      // ... attachment processing logic would go here ...
+
+      final emailData = {
+        'messageId': messageId,
+        'accountId': account.username,
+        'subject': subject,
+        'sender': senderName,
+        'senderEmail': senderEmail,
+        'timestamp': timestamp,
+        'content': content,
+        'isRead': imapFlags['isRead'] ?? 0,
+        'isStarred': imapFlags['isStarred'] ?? 0,
+        'isAnswered': imapFlags['isAnswered'] ?? 0,
+        'isForwarded': imapFlags['isForwarded'] ?? 0,
+        'isDraft': imapFlags['isDraft'] ?? 0,
+        'isDeleted': imapFlags['isDeleted'] ?? 0,
+        'isJunk': imapFlags['isJunk'] ?? 0,
+        'folderPath': folderName,
+        'imapFolder': folderName,
+        'attachments': jsonEncode(attachments),
+        'hasAttachments': hasAttachments,
+        'hasImages': hasImages,
+        'rawEmail': message.mimeData ?? '',
+      };
+
+      await insertEmail(emailData);
+      return emailData;
+    } catch (e) {
+      print('Error processing IMAP message: $e');
+      return null;
+    }
+  }
+
+  // IMAP Folder Management Operations
+  
+  /// Create a new IMAP folder on the server
+  /// Note: Folder creation may not be supported by all IMAP servers
+  Future<bool> createImapFolder(EmailAccount account, String folderName) async {
+    try {
+      final imapClient = ImapClient();
+      await imapClient.connectToServer(account.imap, 993, isSecure: true);
+      await imapClient.login(account.username, account.password);
+      
+      // Note: createMailbox API may require a Mailbox object in some versions
+      // For now, attempt creation and handle gracefully if not supported
+      try {
+        await imapClient.createMailbox(folderName);
+        print('✅ Created IMAP folder: $folderName for ${account.username}');
+      } catch (createError) {
+        print('❌ Folder creation not supported or failed: $createError');
+        await imapClient.logout();
+        return false;
+      }
+      
+      await imapClient.logout();
+      return true;
+    } catch (e) {
+      print('❌ Error creating IMAP folder $folderName for ${account.username}: $e');
+      return false;
+    }
+  }
+
+  /// Rename an existing IMAP folder on the server
+  /// Note: Folder renaming is not supported by the enough_mail library
+  Future<bool> renameImapFolder(EmailAccount account, String oldName, String newName) async {
+    print('❌ IMAP folder renaming not supported by enough_mail library');
+    return false;
+  }
+
+  /// Delete an IMAP folder from the server
+  /// Note: Folder deletion is not supported by the enough_mail library
+  Future<bool> deleteImapFolder(EmailAccount account, String folderName) async {
+    print('❌ IMAP folder deletion not supported by enough_mail library');
+    return false;
+  }
+
+  /// Move an email to a different IMAP folder
+  /// Note: Email moving is not supported by the enough_mail library
+  Future<bool> moveEmailToImapFolder({
+    required EmailAccount account,
+    required String messageId,
+    required String targetFolder,
+  }) async {
+    print('❌ IMAP email moving not supported by enough_mail library');
+    
+    // For now, just update the local database
+    try {
+      final db = await instance.database;
+      final result = await db.update(
+        'emails',
+        {'imapFolder': targetFolder},
+        where: 'messageId = ? AND accountId = ?',
+        whereArgs: [messageId, account.username],
+      );
+      
+      if (result > 0) {
+        print('✅ Updated local folder assignment for email $messageId to: $targetFolder');
+        return true;
+      } else {
+        print('❌ Email not found in local database: $messageId');
+        return false;
+      }
+    } catch (e) {
+      print('❌ Error updating local folder assignment: $e');
+      return false;
+    }
+  }
+
+  /// Subscribe to an IMAP folder (makes it visible in folder list)
+  /// Note: Folder subscription is not supported by the enough_mail library
+  Future<bool> subscribeToImapFolder(EmailAccount account, String folderName) async {
+    print('❌ IMAP folder subscription not supported by enough_mail library');
+    return false;
+  }
+
+  /// Unsubscribe from an IMAP folder (hides it from folder list)
+  /// Note: Folder subscription is not supported by the enough_mail library
+  Future<bool> unsubscribeFromImapFolder(EmailAccount account, String folderName) async {
+    print('❌ IMAP folder subscription not supported by enough_mail library');
+    return false;
+  }
+}
+
+class HtmlStyleFilter {
+  static const String _configFileName = 'html_style_filter.json';
+  static final Set<String> _defaultUnsupportedAttributes = {
+    'minWidth',
+    'maxWidth',
+  };
+
+  static Future<String> _getConfigFilePath() async {
+    final dbPath = await getDatabasesPath();
+    return '$dbPath/$_configFileName';
+  }
+
+  static Future<Set<String>> loadUnsupportedAttributes() async {
+    try {
+      final filePath = await _getConfigFilePath();
+      final file = File(filePath);
+      if (await file.exists()) {
+        final jsonString = await file.readAsString();
+        final List<dynamic> attributes = jsonDecode(jsonString);
+        return attributes.map((attr) => attr.toString()).toSet();
+      } else {
+        await file
+            .writeAsString(jsonEncode(_defaultUnsupportedAttributes.toList()));
+        return _defaultUnsupportedAttributes;
+      }
+    } catch (e) {
+      print('Error loading HTML style filter config: $e');
+      return _defaultUnsupportedAttributes;
+    }
+  }
+}
+
+class EmailListScreen extends StatefulWidget {
+  const EmailListScreen({Key? key}) : super(key: key);
+
+  @override
+  _EmailListScreenState createState() => _EmailListScreenState();
+}
+
+class _EmailListScreenState extends State<EmailListScreen> {
+  List<Map<String, dynamic>> _emails = [];
+  List<EmailAccount> _accounts = [];
+  bool _isLoading = true;
+  bool _isSyncing = false;
+  String _searchQuery = '';
+  final TextEditingController _searchController = TextEditingController();
+
+  final ScrollController _scrollController = ScrollController();
+  int _offset = 0;
+  final int _limit = 50;
+  bool _isLoadingMore = false;
+  bool _alwaysShowText = false; // Setting for text display
+  
+  // Threading state management
+  Set<String> _expandedThreads = <String>{};
+  Map<String, List<Map<String, dynamic>>> _threadCache = {};
+  
+  // Email polling
+  Timer? _emailPollTimer;
+  static const Duration _pollInterval = Duration(minutes: 1); // Check every 1 minute for faster updates
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings(); // Load saved settings
+    _initializeApp();
+    _scrollController.addListener(_scrollListener);
+    
+    // Initialize filter system
+    FilterManager.instance.filterNotifier.addListener(_onFilterChanged);
+    
+    // Test mbox processing
+    _processMboxFile('image test.mbox');
+    
+    // Start automatic email polling
+    _startEmailPolling();
+  }
+
+  @override
+  void dispose() {
+    _scrollController.removeListener(_scrollListener);
+    _scrollController.dispose();
+    _searchController.dispose();
+    
+    // Stop email polling
+    _emailPollTimer?.cancel();
+    
+    // Remove filter listener
+    FilterManager.instance.filterNotifier.removeListener(_onFilterChanged);
+    
+    super.dispose();
+  }
+
+  // Handle filter changes
+  void _onFilterChanged() {
+    setState(() {
+      _offset = 0;
+      _emails = [];
+    });
+    _loadEmailsFromDb();
+  }
+
+  String _buildFilterStatusText(EmailFilter filter) {
+    final List<String> parts = [];
+    
+    if (filter.enabledAccounts.isNotEmpty) {
+      parts.add('${filter.enabledAccounts.length} account${filter.enabledAccounts.length > 1 ? 's' : ''}');
+    }
+    
+    if (filter.enabledStates.length != 1 || !filter.enabledStates.contains(MailState.inbox)) {
+      final stateNames = filter.enabledStates.map((s) => s.displayName).join(', ');
+      parts.add(stateNames);
+    }
+    
+    if (filter.enabledFolders.isNotEmpty) {
+      parts.add('${filter.enabledFolders.length} folder${filter.enabledFolders.length > 1 ? 's' : ''}');
+    }
+    
+    if (filter.searchQuery.isNotEmpty) {
+      parts.add('"${filter.searchQuery}"');
+    }
+    
+    if (parts.isEmpty) {
+      return 'Showing all emails';
+    }
+    
+    return 'Filtered by: ${parts.join(' • ')}';
+  }
+
+  Future<void> _loadSettings() async {
+    const secureStorage = FlutterSecureStorage();
+    String? value = await secureStorage.read(key: 'alwaysShowText');
+    setState(() {
+      _alwaysShowText = value == 'true';
+    });
+    print('Text-only: $_alwaysShowText');
+  }
+
+  Future<void> _saveSettings() async {
+    const secureStorage = FlutterSecureStorage();
+    await secureStorage.write(
+        key: 'alwaysShowText', value: _alwaysShowText.toString());
+    print('Text-only: $_alwaysShowText');
+  }
+
+  Future<void> _scrollListener() async {
+    if (_scrollController.position.pixels ==
+            _scrollController.position.maxScrollExtent &&
+        !_isLoadingMore) {
+      setState(() {
+        _isLoadingMore = true;
+      });
+      await _loadMoreEmails();
+      setState(() {
+        _isLoadingMore = false;
+      });
+    }
+  }
+
+  Future<void> _initializeApp() async {
+    try {
+      await _loadAccounts();
+      await _loadEmailsFromDb();
+      setState(() {
+        _isLoading = false;
+      });
+      _syncEmailsInBackground();
+    } catch (e) {
+      print('App initialization failed: $e');
+      setState(() {
+        _isLoading = false;
+      });
+      
+      // Show error dialog to user
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _showDatabaseErrorDialog(e.toString());
+      });
+    }
+  }
+
+  void _showDatabaseErrorDialog(String error) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Database Error'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('The app failed to initialize the database:'),
+              const SizedBox(height: 8),
+              Text(
+                error,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+              ),
+              const SizedBox(height: 16),
+              if (error.contains('libsqlite3.so')) ...[
+                const Text('To fix this issue, run these commands in terminal:'),
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade800,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Text(
+                    'sudo apt update\nsudo apt install libsqlite3-dev sqlite3',
+                    style: TextStyle(fontFamily: 'monospace', fontSize: 12),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text('Then restart the application.'),
+              ] else ...[
+                const Text('Please check the console output for more details.'),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              // Exit the app since database is required
+              exit(0);
+            },
+            child: const Text('Exit'),
+          ),
+          if (!error.contains('libsqlite3.so'))
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                // Try to continue without database (limited functionality)
+              },
+              child: const Text('Continue Anyway'),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _syncEmailsInBackground() async {
+    if (_isSyncing) return;
+    setState(() {
+      _isSyncing = true;
+    });
+    await _fetchEmails();
+    await _loadEmailsFromDb(refresh: true);
+    setState(() {
+      _isSyncing = false;
+    });
+  }
+
+  Future<void> _loadAccounts() async {
+    _accounts = await DatabaseHelper.instance.getAccounts();
+    if (_accounts.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _showAccountSetupDialog();
+      });
+    } else {
+      // Initialize filter with all accounts when accounts are loaded
+      final accountUsernames = _accounts.map((acc) => acc.username).toList();
+      FilterManager.instance.initializeWithAllOptions(accountUsernames, _accounts);
+    }
+  }
+
+  Future<void> _refreshEmails() async {
+    setState(() {
+      _isLoading = true;
+      _offset = 0;
+      _emails = [];
+    });
+    await _fetchEmails();
+    await _loadEmailsFromDb();
+    setState(() {
+      _isLoading = false;
+    });
+  }
+
+  Future<void> _fetchEmails() async {
+    if (_accounts.isEmpty) {
+      print("No accounts found to fetch emails from");
+      return;
+    }
+
+    for (var account in _accounts) {
+      try {
+        final imapClient = ImapClient();
+        await imapClient.connectToServer(account.imap, 993, isSecure: true);
+        await imapClient.login(account.username, account.password);
+        final mailbox = await imapClient.selectInbox();
+
+        final messageCount = mailbox.messagesExists;
+        print("Total messages in inbox for ${account.username}: $messageCount");
+
+        if (messageCount > 0) {
+          const batchSize = 100;
+          for (int batchStart = 1;
+              batchStart <= messageCount;
+              batchStart += batchSize) {
+            final batchEnd = min(batchStart + batchSize - 1, messageCount);
+            final sequence = MessageSequence.fromRange(
+              batchStart,
+              batchEnd,
+              isUidSequence: false,
+            );
+            print(
+                "Fetching messages $batchStart-$batchEnd for ${account.username}");          final fetchResult = await imapClient.fetchMessages(
+            sequence,
+            'BODY[] FLAGS',
+          );
+
+            final db = await DatabaseHelper.instance.database;
+            final existingMessages = await db.query(
+              'emails',
+              columns: ['messageId'],
+              where: 'accountId = ?',
+              whereArgs: [account.username],
+            );
+            final existingMessageIds = existingMessages
+                .map((msg) => msg['messageId'] as String)
+                .toSet();
+
+            int newEmailsAdded = 0;
+            for (var message in fetchResult.messages) {
+              final String messageId = message.guid?.toString() ??
+                  message.uid?.toString() ??
+                  message.sequenceId?.toString() ??
+                  "${account.username}_${DateTime.now().millisecondsSinceEpoch}_$newEmailsAdded";
+
+              if (existingMessageIds.contains(messageId)) continue;
+
+              String senderName = 'Unknown';
+              String senderEmail = 'unknown@example.com';
+              
+              // First try to get sender from envelope.from (the actual sender)
+              if (message.envelope?.from != null &&
+                  message.envelope!.from!.isNotEmpty) {
+                var sender = message.envelope!.from![0];
+                senderName = (sender.personalName?.isNotEmpty == true) ? sender.personalName! : sender.email;
+                senderEmail = sender.email;
+              }
+              
+              // If envelope.from is not available, try parsing the From header
+              if (senderEmail == 'unknown@example.com') {
+                final fromHeader = message.getHeaderValue('from');
+                if (fromHeader?.isNotEmpty ?? false) {
+                  try {
+                    var from = MailAddress.parse(fromHeader!);
+                    senderName = (from.personalName?.isNotEmpty == true) ? from.personalName! : from.email;
+                    senderEmail = from.email;
+                  } catch (e) {
+                    print("Error parsing From header: $e");
+                  }
+                }
+              }
+
+              final timestamp =
+                  message.envelope?.date?.millisecondsSinceEpoch ??
+                      _parseEmailDate(message.getHeaderValue('date')) ??
+                      DateTime.now().millisecondsSinceEpoch;
+
+              // Prefer HTML content over plain text when available to preserve CID references
+              String htmlContent = message.decodeTextHtmlPart() ?? '';
+              String textContent = message.decodeTextPlainPart() ?? '';
+              String content = htmlContent.isNotEmpty ? htmlContent : textContent;
+              if (content.isEmpty) content = 'No content available';
+
+              // Debug logging
+              print("DEBUG: Processing message '${message.decodeSubject()}'");
+              print("DEBUG: HTML content length: ${htmlContent.length}");
+              print("DEBUG: Text content length: ${textContent.length}");
+              print("DEBUG: Final content length: ${content.length}");
+              if (htmlContent.isNotEmpty) {
+                print("DEBUG: HTML preview: ${htmlContent.substring(0, min(200, htmlContent.length))}");
+              }
+              print("DEBUG: Message media type: ${message.mediaType}");
+              print("DEBUG: Message parts count: ${message.parts?.length ?? 0}");
+              
+              // Debug all parts recursively
+              void debugParts(List<MimePart>? parts, String prefix) {
+                if (parts == null) return;
+                for (int i = 0; i < parts.length; i++) {
+                  var part = parts[i];
+                  print("$prefix Part $i:");
+                  print("$prefix   Content-Type: ${part.getHeaderValue('content-type')}");
+                  print("$prefix   Content-Disposition: ${part.getHeaderValue('content-disposition')}");
+                  print("$prefix   Content-ID: ${part.getHeaderValue('content-id')}");
+                  print("$prefix   Media Type: ${part.mediaType}");
+                  
+                  if (part.parts != null && part.parts!.isNotEmpty) {
+                    print("$prefix   Has ${part.parts!.length} nested parts:");
+                    debugParts(part.parts, "$prefix   ");
+                  }
+                  
+                  final contentType = part.getHeaderValue('content-type') ?? '';
+                  if (contentType.startsWith('text/')) {
+                    final textContent = part.decodeContentText();
+                    print("$prefix   Text content length: ${textContent?.length ?? 0}");
+                    if (textContent != null && textContent.isNotEmpty) {
+                      print("$prefix   Text preview: ${textContent.substring(0, min(100, textContent.length))}");
+                    }
+                  }
+                  
+                  if (contentType.startsWith('image/')) {
+                    final imageData = part.decodeContentBinary();
+                    print("$prefix   Image data length: ${imageData?.length ?? 0} bytes");
+                  }
+                }
+              }
+              
+              debugParts(message.parts, "DEBUG:");
+
+              List<Map<String, dynamic>> attachments = [];
+              int hasAttachments = 0;
+              int hasImages = 0;
+              
+              // Process all parts including nested parts
+              void processPartsRecursively(List<MimePart>? parts) {
+                if (parts == null) return;
+                
+                for (int i = 0; i < parts.length; i++) {
+                  var part = parts[i];
+                  
+                  // Process nested parts first
+                  if (part.parts != null && part.parts!.isNotEmpty) {
+                    processPartsRecursively(part.parts);
+                  }
+                  
+                  final disposition = part.getHeaderValue('content-disposition');
+                  final contentType = part.getHeaderValue('content-type') ?? 'application/octet-stream';
+                  bool isAttachment = disposition?.toLowerCase().contains('attachment') ?? false;
+                  bool isInline = disposition?.toLowerCase().contains('inline') ?? false;
+                  bool isImage = contentType.toLowerCase().startsWith('image/');
+
+                  print("DEBUG: Part $i - isAttachment: $isAttachment, isInline: $isInline, isImage: $isImage");
+
+                  // Store all attachments and all images (including inline images)
+                  if (isAttachment || isImage || isInline) {
+                    final filename = part.getHeaderValue('filename') ??
+                        (disposition != null && disposition.contains('filename=')
+                            ? disposition.split('filename=')[1].replaceAll('"', '').trim()
+                            : 'attachment_${contentType.split('/').last}');
+                    final data = part.decodeContentBinary();
+                    if (data != null) {
+                      // Get Content-ID with better fallback handling
+                      String? contentId = part.getHeaderValue('content-id') ?? part.getHeaderValue('Content-ID');
+                      if (contentId != null) {
+                        contentId = contentId.replaceAll('<', '').replaceAll('>', '');
+                      }
+                      
+                      print("DEBUG: Processing attachment - filename: $filename, contentId: $contentId, data length: ${data.length}");
+                      
+                      attachments.add({
+                        'filename': filename,
+                        'contentType': contentType,
+                        'data': base64Encode(data),
+                        'cid': contentId,
+                        'disposition': disposition?.toLowerCase() ?? '',
+                        'isInline': isInline,
+                      });
+                      hasAttachments = 1;
+                      if (isImage) {
+                        hasImages = 1;
+                      }
+                    }
+                  }
+                }
+              }
+              
+              processPartsRecursively(message.parts);
+              
+              // Now process the HTML content to replace CID references with data URLs
+              if (htmlContent.isNotEmpty && attachments.isNotEmpty) {
+                content = _replaceCidReferences(htmlContent, attachments);
+                print("DEBUG: After CID replacement, content length: ${content.length}");
+              }
+              
+              print("DEBUG: Found ${attachments.length} attachments total");
+
+              String attachmentsJson = jsonEncode(attachments);
+
+              print(
+                  "Fetched content for '${message.decodeSubject()}': ${content.substring(0, min(100, content.length))}...");
+              print(
+                  "Message ID: $messageId, hasImages: $hasImages, hasAttachments: $hasAttachments");
+
+              String? inReplyTo = message.getHeaderValue('in-reply-to');
+              String references = message.getHeaderValue('references') ?? '';
+              String subject = message.decodeSubject() ?? '(No Subject)';
+
+              final relatedEmails =
+                  await DatabaseHelper.instance.findThreadEmails(
+                senderEmail: senderEmail,
+                subject: subject,
+                accountId: account.username,
+                inReplyTo: inReplyTo,
+                references: references,
+              );
+
+              String threadParentId = messageId;
+              if (relatedEmails.isNotEmpty) {
+                final latestRelated = relatedEmails.reduce((a, b) =>
+                    (a['timestamp'] as int) > (b['timestamp'] as int) ? a : b);
+                threadParentId = latestRelated['messageId'] as String;
+              }
+
+              // Try to get raw email content
+              String rawEmailContent = '';
+              try {
+                // Check if the MimeMessage has methods to access raw content
+                // Try toString() first, which might give us the reconstructed message
+                rawEmailContent = message.toString();
+                
+                // If that doesn't work, try to rebuild from envelope and parts
+                if (rawEmailContent.isEmpty && message.envelope != null) {
+                  // Build raw content from headers and parts
+                  final headers = <String>[];
+                  
+                  // Add major headers
+                  if (message.getHeaderValue('message-id') != null) {
+                    headers.add('Message-ID: ${message.getHeaderValue('message-id')}');
+                  }
+                  if (message.getHeaderValue('date') != null) {
+                    headers.add('Date: ${message.getHeaderValue('date')}');
+                  }
+                  if (message.getHeaderValue('from') != null) {
+                    headers.add('From: ${message.getHeaderValue('from')}');
+                  }
+                  if (message.getHeaderValue('to') != null) {
+                    headers.add('To: ${message.getHeaderValue('to')}');
+                  }
+                  if (message.getHeaderValue('subject') != null) {
+                    headers.add('Subject: ${message.getHeaderValue('subject')}');
+                  }
+                  if (message.getHeaderValue('content-type') != null) {
+                    headers.add('Content-Type: ${message.getHeaderValue('content-type')}');
+                  }
+                  
+                  rawEmailContent = headers.join('\r\n') + '\r\n\r\n' + content;
+                }
+              } catch (e) {
+                print("DEBUG: Could not get raw email content: $e");
+                // Fallback: just use the processed content
+                rawEmailContent = content;
+              }
+
+              // Parse IMAP flags from the message
+              final imapFlags = ImapFlagsHelper.parseImapFlags(message);
+
+              await DatabaseHelper.instance.insertEmail({
+                'messageId': messageId,
+                'accountId': account.username,
+                'subject': subject,
+                'sender': senderName,
+                'senderEmail': senderEmail,
+                'timestamp': timestamp,
+                'content': content,
+                'isRead': imapFlags['isRead'] ?? 0,
+                'isStarred': imapFlags['isStarred'] ?? 0,
+                'isAnswered': imapFlags['isAnswered'] ?? 0,
+                'isForwarded': imapFlags['isForwarded'] ?? 0,
+                'isDraft': imapFlags['isDraft'] ?? 0,
+                'isDeleted': imapFlags['isDeleted'] ?? 0,
+                'isJunk': imapFlags['isJunk'] ?? 0,
+                'folderPath': 'INBOX',
+                'inReplyTo': inReplyTo ?? '',
+                'references': references,
+                'attachments': attachmentsJson,
+                'threadParentId': threadParentId,
+                'hasAttachments': hasAttachments,
+                'hasImages': hasImages,
+                'rawEmail': rawEmailContent,
+              });
+
+              for (var related in relatedEmails) {
+                if (related['messageId'] != messageId) {
+                  await DatabaseHelper.instance.updateThreadParent(
+                    related['messageId'] as String,
+                    threadParentId,
+                  );
+                }
+              }
+
+              newEmailsAdded++;
+            }
+            print(
+                "Added $newEmailsAdded new emails for ${account.username} in batch $batchStart-$batchEnd");
+          }
+        }
+
+        await imapClient.logout();
+        print("✅ Completed fetching emails for ${account.username}");
+      } catch (e) {
+        print("Error fetching emails for ${account.username}: $e");
+      }
+    }
+    
+    print("📧 Fetch emails operation completed");
+  }
+
+  // NEW: Optimized method for polling that only gets new emails
+  Future<void> _fetchNewEmailsOnly() async {
+    if (_accounts.isEmpty) {
+      print("No accounts found to fetch emails from");
+      return;
+    }
+
+    for (var account in _accounts) {
+      try {
+        print("🔄 Checking for new emails for ${account.username}...");
+        final imapClient = ImapClient();
+        await imapClient.connectToServer(account.imap, 993, isSecure: true);
+        await imapClient.login(account.username, account.password);
+        final mailbox = await imapClient.selectInbox();
+
+        final messageCount = mailbox.messagesExists;
+        
+        // Get the count of existing emails for this account
+        final db = await DatabaseHelper.instance.database;
+        final existingCountResult = await db.rawQuery(
+          'SELECT COUNT(*) as count FROM emails WHERE accountId = ?',
+          [account.username]
+        );
+        final existingCount = existingCountResult.first['count'] as int;
+        
+        if (messageCount > existingCount) {
+          // Only fetch the new emails
+          final newEmailCount = messageCount - existingCount;
+          print("📧 Found $newEmailCount new emails for ${account.username}");
+          
+          final sequence = MessageSequence.fromRange(
+            existingCount + 1,
+            messageCount,
+            isUidSequence: false,
+          );
+          
+          final fetchResult = await imapClient.fetchMessages(
+            sequence,
+            'BODY[] FLAGS',
+          );
+
+          int newEmailsAdded = 0;
+          for (var message in fetchResult.messages) {
+            final processedEmail = await DatabaseHelper.instance.processImapMessage(message, account, 'INBOX');
+            if (processedEmail != null) {
+              newEmailsAdded++;
+            }
+          }
+          
+          print("📧 Added $newEmailsAdded new emails for ${account.username}");
+        } else {
+          print("📧 No new emails for ${account.username}");
+        }
+
+        await imapClient.logout();
+      } catch (e) {
+        print("Error checking new emails for ${account.username}: $e");
+      }
+    }
+  }
+
+  int? _parseEmailDate(String? dateStr) {
+    if (dateStr == null || dateStr.isEmpty) return null;
+    try {
+      final dateFormat = DateFormat('EEE, dd MMM yyyy HH:mm:ss Z');
+      final date = dateFormat.parse(dateStr, true);
+      return date.millisecondsSinceEpoch;
+    } catch (e) {
+      print("Error parsing date '$dateStr': $e");
+      return null;
+    }
+  }
+
+  Future<void> _loadEmailsFromDb({bool refresh = false}) async {
+    final currentFilter = FilterManager.instance.currentFilter;
+    final emails = await DatabaseHelper.instance.getEmails(
+      searchQuery: _searchQuery, // Keep old search for compatibility
+      limit: _limit,
+      offset: _offset,
+      filter: currentFilter, // Use filter system
+    );
+
+    setState(() {
+      if (refresh || _offset == 0) {
+        _emails = List<Map<String, dynamic>>.from(emails);
+      } else {
+        _emails.addAll(emails);
+      }
+      _emails.sort(
+          (a, b) => (b['timestamp'] as int).compareTo(a['timestamp'] as int));
+    });
+  }
+
+  Future<void> _loadMoreEmails() async {
+    _offset += _limit;
+    await _loadEmailsFromDb();
+  }
+
+  // Thread management methods
+  Future<void> _toggleThread(String threadParentId) async {
+    setState(() {
+      if (_expandedThreads.contains(threadParentId)) {
+        _expandedThreads.remove(threadParentId);
+      } else {
+        _expandedThreads.add(threadParentId);
+      }
+    });
+
+    // Load thread emails if not cached
+    if (_expandedThreads.contains(threadParentId) && !_threadCache.containsKey(threadParentId)) {
+      final threadEmails = await DatabaseHelper.instance.getThreadEmails(threadParentId);
+      setState(() {
+        _threadCache[threadParentId] = threadEmails;
+      });
+    }
+  }
+
+  bool _isThreadExpanded(String threadParentId) {
+    return _expandedThreads.contains(threadParentId);
+  }
+
+  List<Map<String, dynamic>> _getThreadEmails(String threadParentId) {
+    return _threadCache[threadParentId] ?? [];
+  }
+
+  Widget _buildThreadView(String threadParentId, EmailAccount account) {
+    final threadEmails = _getThreadEmails(threadParentId);
+    
+    if (threadEmails.isEmpty) {
+      return Container(
+        margin: const EdgeInsets.only(left: 24.0, right: 8.0, bottom: 8.0),
+        child: Card(
+          color: Colors.grey.shade100,
+          child: const Padding(
+            padding: EdgeInsets.all(16.0),
+            child: Center(
+              child: CircularProgressIndicator(),
+            ),
+          ),
+        ),
+      );
+    }
+
+    // Filter out the main email (parent) and sort by timestamp
+    final replyEmails = threadEmails
+        .where((email) => email['messageId'] != threadParentId)
+        .toList()
+      ..sort((a, b) => (a['timestamp'] as int).compareTo(b['timestamp'] as int));
+
+    return Container(
+      margin: const EdgeInsets.only(left: 24.0, right: 8.0, bottom: 8.0),
+      child: Column(
+        children: replyEmails.map((threadEmail) {
+          final bool hasImages = (threadEmail['hasImages'] ?? 0) == 1;
+          final attachments = attachmentsWithoutImages(threadEmail['attachments'] ?? '[]');
+          final bool hasNonImageAttachments = attachments.isNotEmpty;
+
+          return Card(
+            margin: const EdgeInsets.only(bottom: 4.0),
+            // Use same card styling as parent - no special color
+            child: ListTile(
+              dense: true,
+              leading: CircleAvatar(
+                radius: 16,
+                backgroundColor: account.color,
+                child: Text(
+                  account.display[0].toUpperCase(),
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+              ),
+              title: Row(
+                children: [
+                  const Icon(Icons.subdirectory_arrow_right, size: 16, color: Colors.grey),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      threadEmail['subject'] ?? 'No Subject',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  if (hasImages) 
+                    const Padding(
+                      padding: EdgeInsets.only(left: 4.0),
+                      child: Icon(Icons.image, size: 14, color: Colors.orange),
+                    ),
+                  if (hasNonImageAttachments)
+                    const Padding(
+                      padding: EdgeInsets.only(left: 4.0),
+                      child: Icon(Icons.attach_file, size: 14, color: Colors.blue),
+                    ),
+                ],
+              ),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${threadEmail['sender']} <${threadEmail['senderEmail']}>',
+                    style: const TextStyle(fontSize: 12),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text(
+                    DateFormat('MMM d, yyyy h:mm a').format(
+                      DateTime.fromMillisecondsSinceEpoch(
+                        threadEmail['timestamp'] ?? 0,
+                      ),
+                    ),
+                    style: TextStyle(
+                      color: Colors.grey[600],
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
+              ),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => EmailDetailScreen(
+                      email: threadEmail,
+                      account: account,
+                      alwaysShowText: _alwaysShowText,
+                    ),
+                  ),
+                );
+              },
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  // Email polling methods
+  void _startEmailPolling() {
+    _emailPollTimer = Timer.periodic(_pollInterval, (timer) {
+      _checkForNewEmails();
+    });
+    print('📧 Started automatic email polling every ${_pollInterval.inMinutes} minutes');
+  }
+
+  Future<void> _checkForNewEmails() async {
+    if (_isSyncing) {
+      print('📧 Skipping email check - sync already in progress');
+      return;
+    }
+
+    print('📧 Checking for new emails...');
+    try {
+      // Get the total count of emails in database before sync
+      final db = await DatabaseHelper.instance.database;
+      final countBefore = await db.rawQuery('SELECT COUNT(*) as count FROM emails');
+      final emailCountBefore = countBefore.first['count'] as int;
+      
+      // Use optimized method that only fetches new emails
+      await _fetchNewEmailsOnly();
+      
+      // Refresh email list to show new emails
+      await _loadEmailsFromDb(refresh: true);
+      
+      // Get the total count of emails in database after sync
+      final countAfter = await db.rawQuery('SELECT COUNT(*) as count FROM emails');
+      final emailCountAfter = countAfter.first['count'] as int;
+      final newEmailCount = emailCountAfter - emailCountBefore;
+      
+      if (newEmailCount > 0) {
+        print('📧 Found $newEmailCount new email(s)!');
+        
+        // Show notification for new emails
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('📧 $newEmailCount new email${newEmailCount > 1 ? 's' : ''} received'),
+            backgroundColor: Colors.blue,
+            duration: const Duration(seconds: 3),
+            action: SnackBarAction(
+              label: 'View',
+              textColor: Colors.white,
+              onPressed: () {
+                // Scroll to top to show newest emails
+                _scrollController.animateTo(
+                  0.0,
+                  duration: const Duration(milliseconds: 500),
+                  curve: Curves.easeInOut,
+                );
+              },
+            ),
+          ),
+        );
+      } else {
+        print('📧 No new emails found');
+      }
+      
+      print('📧 Email check completed successfully');
+    } catch (e) {
+      print('📧 Error during automatic email check: $e');
+    }
+  }
+
+  void _showAccountSetupDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('No Email Accounts'),
+        content: const Text(
+            'Would you like to set up an email account or import accounts from a JSON file?'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _showAccountAddDialog();
+            },
+            child: const Text('Add Account'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _importAccounts();
+            },
+            child: const Text('Import Accounts'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAccountAddDialog() {
+    final formKey = GlobalKey<FormState>();
+    String imap = '';
+    String smtp = '';
+    String username = '';
+    String password = '';
+    String replyFrom = '';
+       String name = '';
+    String signature = '';
+    Color color = Colors.red;
+    String display = '';
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Add Email Account'),
+        content: Form(
+          key: formKey,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  decoration: const InputDecoration(labelText: 'IMAP Server'),
+                  validator: (value) => value!.isEmpty ? 'Required' : null,
+                  onSaved: (value) => imap = value!,
+                ),
+                TextFormField(
+                  decoration: const InputDecoration(labelText: 'SMTP Server'),
+                  validator: (value) => value!.isEmpty ? 'Required' : null,
+                  onSaved: (value) => smtp = value!,
+                ),
+                TextFormField(
+                  decoration:
+                      const InputDecoration(labelText: 'Email Username'),
+                  validator: (value) => value!.isEmpty ? 'Required' : null,
+                  onSaved: (value) => username = value!,
+                ),
+                TextFormField(
+                  decoration: const InputDecoration(labelText: 'Password'),
+                  obscureText: true,
+                  validator: (value) => value!.isEmpty ? 'Required' : null,
+                  onSaved: (value) => password = value!,
+                ),
+                TextFormField(
+                  decoration:
+                      const InputDecoration(labelText: 'Reply-From Email'),
+                  validator: (value) => value!.isEmpty ? 'Required' : null,
+                  onSaved: (value) => replyFrom = value!,
+                ),
+                TextFormField(
+                  decoration: const InputDecoration(labelText: 'Display Name'),
+                  validator: (value) => value!.isEmpty ? 'Required' : null,
+                  onSaved: (value) => name = value!,
+                ),
+                TextFormField(
+                  decoration:
+                      const InputDecoration(labelText: 'Email Signature'),
+                  maxLines: 3,
+                  onSaved: (value) => signature = value ?? '',
+                ),
+                TextFormField(
+                  decoration:
+                      const InputDecoration(labelText: 'Initials (Display)'),
+                  validator: (value) => value!.isEmpty ? 'Required' : null,
+                  onSaved: (value) => display = value!,
+                ),
+                Row(
+                  children: [
+                    const Text('Account Color: '),
+                    const Spacer(),
+                    Container(
+                      width: 24,
+                      height: 24,
+                      color: color,
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.color_lens),
+                      onPressed: () {
+                        setState(() {
+                          color = Colors.accents[
+                              DateTime.now().second % Colors.accents.length];
+                        });
+                      },
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () async {
+              if (formKey.currentState!.validate()) {
+                formKey.currentState!.save();
+                final account = EmailAccount(
+                  imap: imap,
+                  smtp: smtp,
+                  username: username,
+                  password: password,
+                  replyFrom: replyFrom,
+                  name: name,
+                  signature: signature,
+                  color: color,
+                  display: display,
+                );
+                await DatabaseHelper.instance.insertAccount(account);
+                Navigator.of(context).pop();
+                await _loadAccounts();
+                await _fetchEmails();
+                await _loadEmailsFromDb();
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _importAccounts() async {
+    try {
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+      );
+
+      if (result != null) {
+        final file = File(result.files.single.path!);
+        final jsonString = await file.readAsString();
+        final jsonData = jsonDecode(jsonString);
+
+        if (jsonData['accounts'] != null && jsonData['accounts'] is List) {
+          const secureStorage = FlutterSecureStorage();
+          for (var accountData in jsonData['accounts']) {
+            final account = EmailAccount.fromJson(accountData);
+            await secureStorage.write(
+                key: 'account_${account.username}_password',
+                value: account.password);
+            await DatabaseHelper.instance.insertAccount(account);
+          }
+          setState(() {
+            _accounts = [];
+          });
+          await _loadAccounts();
+          await _fetchEmails();
+          await _loadEmailsFromDb();
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Accounts imported successfully')),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('No valid accounts found in file')),
+          );
+        }
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error importing accounts: $e')),
+      );
+    }
+  }
+
+  Future<void> _exportAccounts() async {
+    try {
+      final accounts = await DatabaseHelper.instance.getAccounts();
+      final jsonData = {
+        'accounts': accounts.map((account) => account.toJson()).toList(),
+      };
+      final jsonString = jsonEncode(jsonData);
+      final directory = await getApplicationDocumentsDirectory();
+      final file = File('${directory.path}/furimail_accounts.json');
+      await file.writeAsString(jsonString);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Accounts exported to ${file.path}')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error exporting accounts: $e')),
+      );
+    }
+  }
+
+  void _showAccountManagementScreen() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => AccountManagementScreen(
+          onAccountsChanged: () async {
+            await _loadAccounts();
+            await _fetchEmails();
+            await _loadEmailsFromDb();
+          },
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final currentFilter = FilterManager.instance.currentFilter;
+    
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('fMail'),
+        backgroundColor: Colors.grey.shade800,
+        foregroundColor: Colors.white,
+        actions: [
+          // Search functionality
+          if (_searchQuery.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.clear),
+              onPressed: () {
+                setState(() {
+                  _searchQuery = '';
+                  _searchController.clear();
+                  _offset = 0;
+                  _emails = [];
+                });
+                _loadEmailsFromDb();
+              },
+            ),
+          IconButton(
+            icon: const Icon(Icons.search),
+            onPressed: () {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Search Emails'),
+                  content: TextField(
+                    controller: _searchController,
+                    decoration: const InputDecoration(
+                      hintText: 'Enter search term...',
+                    ),
+                    autofocus: true,
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: const Text('Cancel'),
+                    ),
+                    TextButton(
+                      onPressed: () {
+                        setState(() {
+                          _searchQuery = _searchController.text;
+                          _offset = 0;
+                          _emails = [];
+                        });
+                        Navigator.of(context).pop();
+                        _loadEmailsFromDb();
+                      },
+                      child: const Text('Search'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+          // Toggle text view setting
+          IconButton(
+            icon: Icon(_alwaysShowText ? Icons.text_fields : Icons.web),
+            onPressed: () {
+              setState(() {
+                _alwaysShowText = !_alwaysShowText;
+              });
+              _saveSettings();
+            },
+            tooltip: _alwaysShowText ? 'Show Rich Content' : 'Show Text Only',
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              switch (value) {
+                case 'add_account':
+                  _showAccountAddDialog();
+                  break;
+                case 'manage_accounts':
+                  _showAccountManagementScreen();
+                  break;
+                case 'import_accounts':
+                  _importAccounts();
+                  break;
+                case 'export_accounts':
+                  _exportAccounts();
+                  break;
+                case 'refresh':
+                  _refreshEmails();
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'add_account',
+                child: Text('Add Account'),
+              ),
+              const PopupMenuItem(
+                value: 'manage_accounts',
+                child: Text('Manage Accounts'),
+              ),
+              const PopupMenuItem(
+                value: 'import_accounts',
+                child: Text('Import Accounts'),
+              ),
+              const PopupMenuItem(
+                value: 'export_accounts',
+                child: Text('Export Accounts'),
+              ),
+              const PopupMenuItem(
+                value: 'refresh',
+                child: Text('Refresh Emails'),
+              ),
+            ],
+          ),
+        ],
+      ),
+      drawer: FilterDrawer(
+        accounts: _accounts,
+        onFilterChanged: _onFilterChanged,
+      ),
+      body: Column(
+        children: [
+          // Filter status bar
+          ValueListenableBuilder<EmailFilter>(
+            valueListenable: FilterManager.instance.filterNotifier,
+            builder: (context, filter, child) {
+              return Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8.0),
+                color: Colors.grey.shade700,
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _buildFilterStatusText(filter),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    if (filter.hasActiveFilters)
+                      TextButton(
+                        onPressed: () {
+                          FilterManager.instance.clearFilter();
+                        },
+                        child: const Text(
+                          'Clear',
+                          style: TextStyle(color: Colors.white, fontSize: 12),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            },
+          ),
+          
+          // Email list
+          Expanded(
+            child: _isLoading
+                ? const Center(child: CircularProgressIndicator())
+                : _emails.isEmpty
+                    ? const Center(child: Text('No emails found'))
+                    : ListView.builder(
+                        controller: _scrollController,
+                        itemCount: _emails.length + (_isLoadingMore ? 1 : 0),
+                        itemBuilder: (context, index) {
+                          if (index >= _emails.length) {
+                            return const Center(child: CircularProgressIndicator());
+                          }
+
+                          final email = _emails[index];
+                          final threadParentId = email['threadParentId'] as String;
+                          final isThreadParent = threadParentId == email['messageId'];
+                          final isThreadExpanded = _isThreadExpanded(threadParentId);
+                          
+                          // Find account for this email
+                          final account = _accounts.firstWhere(
+                            (acc) => acc.username == email['accountId'],
+                            orElse: () => EmailAccount(
+                              imap: '',
+                              smtp: '',
+                              username: email['accountId'],
+                              password: '',
+                              replyFrom: '',
+                              name: 'Unknown',
+                              signature: '',
+                              color: Colors.grey,
+                              display: '?',
+                            ),
+                          );
+
+                          final bool hasImages = (email['hasImages'] ?? 0) == 1;
+                          final attachments = attachmentsWithoutImages(email['attachments'] ?? '[]');
+                          final bool hasNonImageAttachments = attachments.isNotEmpty;
+
+                          // Check if this thread has replies
+                          bool hasReplies = false;
+                          if (isThreadParent) {
+                            hasReplies = _threadCache[threadParentId]?.isNotEmpty ?? false;
+                            if (!_threadCache.containsKey(threadParentId)) {
+                              // Load replies in background
+                              DatabaseHelper.instance.hasReplies(threadParentId).then((hasRep) {
+                                if (hasRep && mounted) {
+                                  setState(() {
+                                    // This will trigger a rebuild to show the thread indicator
+                                  });
+                                }
+                              });
+                            }
+                          }
+
+                          return Column(
+                            children: [
+                              Card(
+                                margin: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+                                child: ListTile(
+                                  leading: CircleAvatar(
+                                    backgroundColor: account.color,
+                                    child: Text(
+                                      account.display.isNotEmpty ? account.display[0].toUpperCase() : '?',
+                                      style: const TextStyle(color: Colors.white),
+                                    ),
+                                  ),
+                                  title: Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          email['subject'] ?? 'No Subject',
+                                          style: TextStyle(
+                                            fontWeight: (email['isRead'] ?? 0) == 0 
+                                                ? FontWeight.bold 
+                                                : FontWeight.normal,
+                                          ),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                      if (hasImages) 
+                                        const Padding(
+                                          padding: EdgeInsets.only(left: 4.0),
+                                          child: Icon(Icons.image, size: 16, color: Colors.orange),
+                                        ),
+                                      if (hasNonImageAttachments)
+                                        const Padding(
+                                          padding: EdgeInsets.only(left: 4.0),
+                                          child: Icon(Icons.attach_file, size: 16, color: Colors.blue),
+                                        ),
+                                      if (isThreadParent && hasReplies)
+                                        Padding(
+                                          padding: const EdgeInsets.only(left: 4.0),
+                                          child: GestureDetector(
+                                            onTap: () => _toggleThread(threadParentId),
+                                            child: Icon(
+                                              isThreadExpanded ? Icons.expand_less : Icons.expand_more,
+                                              size: 16,
+                                              color: Colors.green,
+                                            ),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                  subtitle: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        '${email['sender']} <${email['senderEmail']}>',
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      Text(
+                                        DateFormat('MMM d, yyyy h:mm a').format(
+                                          DateTime.fromMillisecondsSinceEpoch(
+                                            email['timestamp'] ?? 0,
+                                          ),
+                                        ),
+                                        style: TextStyle(
+                                          color: Colors.grey[600],
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  onTap: () {
+                                    Navigator.push(
+                                      context,
+                                      MaterialPageRoute(
+                                        builder: (context) => EmailDetailScreen(
+                                          email: email,
+                                          account: account,
+                                          alwaysShowText: _alwaysShowText,
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ),
+                              // Thread emails (if expanded)
+                              if (isThreadExpanded && hasReplies) 
+                                _buildThreadView(threadParentId, account),
+                            ],
+                          );
+                        },
+                      ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          if (_accounts.isNotEmpty) {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => ComposeScreen(
+                  account: _accounts.first, // Use first account, or add account selection
+                ),
+              ),
+            );
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Please add an email account first')),
+            );
+          }
+        },
+        tooltip: 'Compose Email',
+        child: const Icon(Icons.edit),
+      ),
+    );
+  }
+
+  Widget _buildThreadView(String threadParentId, EmailAccount account) {
+    final threadEmails = _getThreadEmails(threadParentId);
+    
+    if (threadEmails.isEmpty) {
+      return Container(
+        margin: const EdgeInsets.only(left: 24.0, right: 8.0, bottom: 8.0),
+        child: Card(
+          color: Colors.grey.shade100,
+          child: const Padding(
+            padding: EdgeInsets.all(16.0),
+            child: Center(
+              child: CircularProgressIndicator(),
+            ),
+          ),
+        ),
+      );
+    }
+
+    // Filter out the main email (parent) and sort by timestamp
+    final replyEmails = threadEmails
+        .where((email) => email['messageId'] != threadParentId)
+        .toList()
+      ..sort((a, b) => (a['timestamp'] as int).compareTo(b['timestamp'] as int));
+
+    return Container(
+      margin: const EdgeInsets.only(left: 24.0, right: 8.0, bottom: 8.0),
+      child: Column(
+        children: replyEmails.map((threadEmail) {
+          final bool hasImages = (threadEmail['hasImages'] ?? 0) == 1;
+          final attachments = attachmentsWithoutImages(threadEmail['attachments'] ?? '[]');
+          final bool hasNonImageAttachments = attachments.isNotEmpty;
+
+          return Card(
+            margin: const EdgeInsets.only(bottom: 4.0),
+            // Use same card styling as parent - no special color
+            child: ListTile(
+              dense: true,
+              leading: CircleAvatar(
+                radius: 16,
+                backgroundColor: account.color,
+                child: Text(
+                  account.display[0].toUpperCase(),
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+              ),
+              title: Row(
+                children: [
+                  const Icon(Icons.subdirectory_arrow_right, size: 16, color: Colors.grey),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      threadEmail['subject'] ?? 'No Subject',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  if (hasImages) 
+                    const Padding(
+                      padding: EdgeInsets.only(left: 4.0),
+                      child: Icon(Icons.image, size: 14, color: Colors.orange),
+                    ),
+                  if (hasNonImageAttachments)
+                    const Padding(
+                      padding: EdgeInsets.only(left: 4.0),
+                      child: Icon(Icons.attach_file, size: 14, color: Colors.blue),
+                    ),
+                ],
+              ),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${threadEmail['sender']} <${threadEmail['senderEmail']}>',
+                    style: const TextStyle(fontSize: 12),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text(
+                    DateFormat('MMM d, yyyy h:mm a').format(
+                      DateTime.fromMillisecondsSinceEpoch(
+                        threadEmail['timestamp'] ?? 0,
+                      ),
+                    ),
+                    style: TextStyle(
+                      color: Colors.grey[600],
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
+              ),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => EmailDetailScreen(
+                      email: threadEmail,
+                      account: account,
+                      alwaysShowText: _alwaysShowText,
+                    ),
+                  ),
+                );
+              },
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  List<dynamic> attachmentsWithoutImages(String attachmentsJson) {
+    final attachments =
+        jsonDecode(attachmentsJson.isEmpty ? '[]' : attachmentsJson);
+    return attachments
+        .where((a) => !a['contentType'].toString().startsWith('image/'))
+        .toList();
+  }
+
+  // Test function to process mbox files directly
+  Future<void> _processMboxFile(String filename) async {
+    // Implementation would go here for processing mbox files
+    print('Processing mbox file: $filename');
+  }
+
+  // Helper method to replace CID references with data URLs
+  String _replaceCidReferences(String htmlContent, List<Map<String, dynamic>> attachments) {
+    String processedContent = htmlContent;
+    
+    for (var attachment in attachments) {
+      final cid = attachment['cid'];
+      if (cid != null && cid.isNotEmpty) {
+        final contentType = attachment['contentType'];
+        final data = attachment['data'];
+        
+        if (data != null && contentType != null) {
+          final dataUrl = 'data:$contentType;base64,$data';
+          processedContent = processedContent.replaceAll('cid:$cid', dataUrl);
+        }
+      }
+    }
+    
+    return processedContent;
+  }
+}
+
+// Define ReplyScreen that's used in EmailDetailScreen
+class ReplyScreen extends StatelessWidget {
+  final Map<String, dynamic> email;
+  final dynamic account;
+
+  const ReplyScreen({
+    Key? key,
+    required this.email,
+    required this.account,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final TextEditingController controller = TextEditingController();
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Reply to ${email['subject']}'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.send),
+            onPressed: () {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                    content: Text('Sending functionality coming soon')),
+              );
+            },
+          ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            TextField(
+              controller: controller,
+              maxLines: 10,
+              decoration: const InputDecoration(
+                hintText: 'Type your reply...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            if (account.signature.isNotEmpty)
+              Text(
+                '\n\n${account.signature}',
+                style: TextStyle(
+                  color: Colors.grey[600],
+                  fontSize: 12,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Comprehensive Account Management Screen
+class AccountManagementScreen extends StatefulWidget {
+  final VoidCallback onAccountsChanged;
+
+  const AccountManagementScreen({
+    Key? key,
+    required this.onAccountsChanged,
+  }) : super(key: key);
+
+  @override
+  _AccountManagementScreenState createState() => _AccountManagementScreenState();
+}
+
+class _AccountManagementScreenState extends State<AccountManagementScreen> {
+  List<EmailAccount> _accounts = [];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAccounts();
+  }
+
+  Future<void> _loadAccounts() async {
+    setState(() {
+      _isLoading = true;
+    });
+    _accounts = await DatabaseHelper.instance.getAccounts();
+    setState(() {
+      _isLoading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Account Management'),
+        backgroundColor: Colors.grey.shade800,
+        foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.add),
+            onPressed: _showAddAccountDialog,
+            tooltip: 'Add Account',
+          ),
+        ],
+      ),
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : _accounts.isEmpty
+              ? Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.email_outlined,
+                        size: 64,
+                        color: Colors.grey.shade400,
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'No Email Accounts',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey.shade600,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Add your first email account to get started',
+                        style: TextStyle(
+                          color: Colors.grey.shade500,
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      ElevatedButton.icon(
+                        onPressed: _showAddAccountDialog,
+                        icon: const Icon(Icons.add),
+                        label: const Text('Add Account'),
+                      ),
+                    ],
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: _accounts.length,
+                  itemBuilder: (context, index) {
+                    final account = _accounts[index];
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                CircleAvatar(
+                                  backgroundColor: account.color,
+                                  child: Text(
+                                    account.display.isNotEmpty ? account.display[0].toUpperCase() : '?',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 16),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        account.name,
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      Text(
+                                        account.username,
+                                        style: TextStyle(
+                                          color: Colors.grey.shade600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                PopupMenuButton<String>(
+                                  onSelected: (value) {
+                                    switch (value) {
+                                      case 'edit':
+                                        _showEditAccountDialog(account);
+                                        break;
+                                      case 'delete':
+                                        _showDeleteAccountDialog(account);
+                                        break;
+                                    }
+                                  },
+                                  itemBuilder: (context) => [
+                                    const PopupMenuItem(
+                                      value: 'edit',
+                                      child: Row(
+                                        children: [
+                                          Icon(Icons.edit, size: 18),
+                                          SizedBox(width: 8),
+                                          Text('Edit'),
+                                        ],
+                                      ),
+                                    ),
+                                    const PopupMenuItem(
+                                      value: 'delete',
+                                      child: Row(
+                                        children: [
+                                          Icon(Icons.delete, size: 18),
+                                          SizedBox(width: 8),
+                                          Text('Delete'),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 16),
+                            _buildAccountInfo('IMAP Server', account.imap),
+                            _buildAccountInfo('SMTP Server', account.smtp),
+                            _buildAccountInfo('Reply From', account.replyFrom),
+                            if (account.signature.isNotEmpty)
+                              _buildAccountInfo('Signature', account.signature),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+    );
+  }
+
+  Widget _buildAccountInfo(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 100,
+            child: Text(
+              '$label:',
+              style: TextStyle(
+                fontWeight: FontWeight.w500,
+                color: Colors.grey.shade700,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(fontSize: 14),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAddAccountDialog() {
+    _showAccountDialog();
+  }
+
+  void _showEditAccountDialog(EmailAccount account) {
+    _showAccountDialog(existingAccount: account);
+  }
+
+  void _showAccountDialog({EmailAccount? existingAccount}) {
+    final formKey = GlobalKey<FormState>();
+    final isEditing = existingAccount != null;
+    
+    String imap = existingAccount?.imap ?? '';
+    String smtp = existingAccount?.smtp ?? '';
+    String username = existingAccount?.username ?? '';
+    String password = existingAccount?.password ?? '';
+    String replyFrom = existingAccount?.replyFrom ?? '';
+    String name = existingAccount?.name ?? '';
+    String signature = existingAccount?.signature ?? '';
+    Color color = existingAccount?.color ?? Colors.red;
+    String display = existingAccount?.display ?? '';
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text(isEditing ? 'Edit Account' : 'Add Account'),
+          content: Form(
+            key: formKey,
+            child: SizedBox(
+              width: 400,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Server Settings Section
+                    const Text(
+                      'Server Settings',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      initialValue: imap,
+                      decoration: const InputDecoration(
+                        labelText: 'IMAP Server',
+                        hintText: 'imap.example.com',
+                        border: OutlineInputBorder(),
+                      ),
+                      validator: (value) => value!.isEmpty ? 'Required' : null,
+                      onSaved: (value) => imap = value!,
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      initialValue: smtp,
+                      decoration: const InputDecoration(
+                        labelText: 'SMTP Server',
+                        hintText: 'smtp.example.com',
+                        border: OutlineInputBorder(),
+                      ),
+                      validator: (value) => value!.isEmpty ? 'Required' : null,
+                      onSaved: (value) => smtp = value!,
+                    ),
+                    const SizedBox(height: 20),
+                    
+                    // Account Details Section
+                    const Text(
+                      'Account Details',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      initialValue: username,
+                      decoration: const InputDecoration(
+                        labelText: 'Username/Email',
+                        hintText: 'user@example.com',
+                        border: OutlineInputBorder(),
+                      ),
+                      validator: (value) => value!.isEmpty ? 'Required' : null,
+                      onSaved: (value) => username = value!,
+                      readOnly: isEditing, // Don't allow username changes when editing
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      initialValue: password,
+                      decoration: const InputDecoration(
+                        labelText: 'Password',
+                        border: OutlineInputBorder(),
+                      ),
+                      obscureText: true,
+                      validator: (value) => value!.isEmpty ? 'Required' : null,
+                      onSaved: (value) => password = value!,
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      initialValue: replyFrom,
+                      decoration: const InputDecoration(
+                        labelText: 'Reply-From Email',
+                        hintText: 'user@example.com',
+                        border: OutlineInputBorder(),
+                      ),
+                      validator: (value) => value!.isEmpty ? 'Required' : null,
+                      onSaved: (value) => replyFrom = value!,
+                    ),
+                    const SizedBox(height: 20),
+                    
+                    // Display Settings Section
+                    const Text(
+                      'Display Settings',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      initialValue: name,
+                      decoration: const InputDecoration(
+                        labelText: 'Display Name',
+                        hintText: 'John Doe',
+                        border: OutlineInputBorder(),
+                      ),
+                      validator: (value) => value!.isEmpty ? 'Required' : null,
+                      onSaved: (value) => name = value!,
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      initialValue: display,
+                      decoration: const InputDecoration(
+                        labelText: 'Initials (Display)',
+                        hintText: 'JD',
+                        border: OutlineInputBorder(),
+                      ),
+                      validator: (value) => value!.isEmpty ? 'Required' : null,
+                      onSaved: (value) => display = value!,
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        const Text('Account Color: '),
+                        const Spacer(),
+                        GestureDetector(
+                          onTap: () {
+                            setDialogState(() {
+                              color = Colors.primaries[Random().nextInt(Colors.primaries.length)];
+                            });
+                          },
+                          child: Container(
+                            width: 40,
+                            height: 40,
+                            decoration: BoxDecoration(
+                              color: color,
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.grey),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        TextButton(
+                          onPressed: () {
+                            setDialogState(() {
+                              color = Colors.primaries[Random().nextInt(Colors.primaries.length)];
+                            });
+                          },
+                          child: const Text('Random'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 20),
+                    
+                    // Signature Section
+                    const Text(
+                      'Signature',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      initialValue: signature,
+                      decoration: const InputDecoration(
+                        labelText: 'Email Signature',
+                        hintText: 'Best regards,\nYour Name',
+                        border: OutlineInputBorder(),
+                        alignLabelWithHint: true,
+                      ),
+                      maxLines: 3,
+                      onSaved: (value) => signature = value ?? '',
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                if (formKey.currentState!.validate()) {
+                  formKey.currentState!.save();
+                  
+                  final account = EmailAccount(
+                    imap: imap,
+                    smtp: smtp,
+                    username: username,
+                    password: password,
+                    replyFrom: replyFrom,
+                    name: name,
+                    signature: signature,
+                    color: color,
+                    display: display,
+                  );
+                  
+                  try {
+                    if (isEditing) {
+                      await DatabaseHelper.instance.updateAccount(account);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Account updated successfully')),
+                      );
+                    } else {
+                      await DatabaseHelper.instance.insertAccount(account);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Account added successfully')),
+                      );
+                    }
+                    
+                    Navigator.of(context).pop();
+                    await _loadAccounts();
+                    widget.onAccountsChanged();
+                  } catch (e) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Error saving account: $e')),
+                    );
+                  }
+                }
+              },
+              child: Text(isEditing ? 'Update' : 'Add'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showDeleteAccountDialog(EmailAccount account) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete Account'),
+        content: Text('Are you sure you want to delete "${account.name}"?\n\nThis will remove all associated emails and cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              try {
+                await DatabaseHelper.instance.deleteAccount(account.username);
+                Navigator.of(context).pop();
+                await _loadAccounts();
+                widget.onAccountsChanged();
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Account deleted successfully')),
+                );
+              } catch (e) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Error deleting account: $e')),
+                );
+              }
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Delete', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+}

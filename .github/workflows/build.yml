@@ -3,7 +3,7 @@ name: Build Linux .deb
 on:
   push:
     branches:
-      - main
+      - master
     tags:
       - 'v*.*.*'
 

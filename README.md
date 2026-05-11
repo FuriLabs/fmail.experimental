@@ -4,6 +4,29 @@ A cross-platform, responsive, email client built with Flutter for [Furi Labs](ht
 
 ---
 
+## Table of Contents
+
+- [Features](#features)
+- [Screenshots](#screenshots)
+- [Target Platforms](#target-platforms)
+- [Prerequisites](#prerequisites)
+- [Development Setup](#development-setup)
+  - [Linux setup](#linux-setup-ubuntu--debian--furi-flx)
+  - [Android setup](#android-setup)
+  - [iOS setup](#ios-setup-macos-only)
+  - [Web](#web-quickest--any-os)
+- [Furi FLX Development Setup](#furi-flx-development-setup)
+- [Build & Run](#build--run)
+- [Account Configuration](#account-configuration)
+- [CI / GitHub Actions](#ci--github-actions)
+- [Backup, Restore & Moving Devices](#backup-restore--moving-devices)
+- [Credential Storage](#credential-storage)
+- [Database](#database)
+- [Contributing & Development](#contributing--development)
+- [License](#license)
+
+---
+
 ## Features
 
 - Multi-account IMAP email with per-account colour coding

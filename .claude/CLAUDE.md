@@ -9,8 +9,8 @@
 **After every code change, feature addition, or bug fix — you MUST update the following files as appropriate:**
 
 - **[README.md](../README.md)** — User-facing docs: features, build instructions, CI, account config. Update if any of these change.
-- **[.claude/docs/TODO.md](.claude/docs/TODO.md)** — Outstanding tasks. Mark fixed bugs as done, add newly discovered issues, update priorities.
-- **[.claude/CLAUDE.md](.claude/CLAUDE.md)** — Architecture and patterns. Update if file structure, DB schema, key classes, or important patterns change.
+- **[docs/TODO.md](docs/TODO.md)** — Outstanding tasks. Mark fixed bugs as done, add newly discovered issues, update priorities.
+- **[CLAUDE.md](CLAUDE.md)** — Architecture and patterns. Update if file structure, DB schema, key classes, or important patterns change.
 
 **This is non-negotiable.** Stale docs cause confusion and wasted time. If you add a feature, document it. If you fix a bug on the TODO, remove it. If you change the schema, update the schema section here.
 
@@ -18,27 +18,27 @@
 
 ## Additional Documentation
 
-Current TODO and historical investigation docs are in `.claude/docs/`:
+Current TODO and historical investigation docs are in `docs/`:
 
-- **[TODO.md](.claude/docs/TODO.md)** — Outstanding bugs, features, and known gotchas. **Read this first.**
+- **[TODO.md](docs/TODO.md)** — Outstanding bugs, features, and known gotchas. **Read this first.**
 
 Historical notes:
 
-- [AI_EMAIL_ASSISTANT_PLAN.md](.claude/docs/AI_EMAIL_ASSISTANT_PLAN.md) - AI assistant feature planning
-- [BATCH_FETCH_OPTIMIZATION_SUMMARY.md](.claude/docs/BATCH_FETCH_OPTIMIZATION_SUMMARY.md) - Batch email fetch optimization
-- [CALDAV_FIX.md](.claude/docs/CALDAV_FIX.md) - CalDAV sync bug fixes
-- [CALENDAR_DEBUG_PLAN.md](.claude/docs/CALENDAR_DEBUG_PLAN.md) - Calendar debugging approach
-- [CALENDAR_SYNC_INVESTIGATION.md](.claude/docs/CALENDAR_SYNC_INVESTIGATION.md) - CalDAV sync investigation notes
-- [CONTACT_QUOTES_FIX.md](.claude/docs/CONTACT_QUOTES_FIX.md) - Contact name quoting fix
-- [DATE_PARSING_FIX_SUMMARY.md](.claude/docs/DATE_PARSING_FIX_SUMMARY.md) - Date parsing bug fixes
-- [ENHANCED_EMAIL_DETAIL_SUMMARY.md](.claude/docs/ENHANCED_EMAIL_DETAIL_SUMMARY.md) - Email detail UI enhancements
-- [FINAL_FIX_SUMMARY.md](.claude/docs/FINAL_FIX_SUMMARY.md) - Summary of major fixes
-- [IMAP_FLAGS_INTEGRATION_SUMMARY.md](.claude/docs/IMAP_FLAGS_INTEGRATION_SUMMARY.md) - IMAP flag sync implementation
-- [PARALLEL_FETCH_FIX_SUMMARY.md](.claude/docs/PARALLEL_FETCH_FIX_SUMMARY.md) - Parallel fetch bug fix
-- [PERFORMANCE_FIX_SUMMARY.md](.claude/docs/PERFORMANCE_FIX_SUMMARY.md) - Performance improvements
-- [RANGEERROR_AND_DATE_DEBUG_FIXES.md](.claude/docs/RANGEERROR_AND_DATE_DEBUG_FIXES.md) - RangeError and date debug fixes
-- [TIMESTAMP_AND_ERROR_FIXES.md](.claude/docs/TIMESTAMP_AND_ERROR_FIXES.md) - Timestamp handling fixes
-- [TODO.md](.claude/docs/TODO.md) - Outstanding tasks and ideas
+- [AI_EMAIL_ASSISTANT_PLAN.md](docs/AI_EMAIL_ASSISTANT_PLAN.md) - AI assistant feature planning
+- [BATCH_FETCH_OPTIMIZATION_SUMMARY.md](docs/BATCH_FETCH_OPTIMIZATION_SUMMARY.md) - Batch email fetch optimization
+- [CALDAV_FIX.md](docs/CALDAV_FIX.md) - CalDAV sync bug fixes
+- [CALENDAR_DEBUG_PLAN.md](docs/CALENDAR_DEBUG_PLAN.md) - Calendar debugging approach
+- [CALENDAR_SYNC_INVESTIGATION.md](docs/CALENDAR_SYNC_INVESTIGATION.md) - CalDAV sync investigation notes
+- [CONTACT_QUOTES_FIX.md](docs/CONTACT_QUOTES_FIX.md) - Contact name quoting fix
+- [DATE_PARSING_FIX_SUMMARY.md](docs/DATE_PARSING_FIX_SUMMARY.md) - Date parsing bug fixes
+- [ENHANCED_EMAIL_DETAIL_SUMMARY.md](docs/ENHANCED_EMAIL_DETAIL_SUMMARY.md) - Email detail UI enhancements
+- [FINAL_FIX_SUMMARY.md](docs/FINAL_FIX_SUMMARY.md) - Summary of major fixes
+- [IMAP_FLAGS_INTEGRATION_SUMMARY.md](docs/IMAP_FLAGS_INTEGRATION_SUMMARY.md) - IMAP flag sync implementation
+- [PARALLEL_FETCH_FIX_SUMMARY.md](docs/PARALLEL_FETCH_FIX_SUMMARY.md) - Parallel fetch bug fix
+- [PERFORMANCE_FIX_SUMMARY.md](docs/PERFORMANCE_FIX_SUMMARY.md) - Performance improvements
+- [RANGEERROR_AND_DATE_DEBUG_FIXES.md](docs/RANGEERROR_AND_DATE_DEBUG_FIXES.md) - RangeError and date debug fixes
+- [TIMESTAMP_AND_ERROR_FIXES.md](docs/TIMESTAMP_AND_ERROR_FIXES.md) - Timestamp handling fixes
+- [TODO.md](docs/TODO.md) - Outstanding tasks and ideas
 
 ---
 

@@ -387,7 +387,7 @@ To install a release `.deb`:
 sudo apt install ./fmail-v1.0.0-linux-amd64.deb
 ```
 
-Use `apt` (not `dpkg -i`) so that dependencies such as `zenity` and `libsqlite3-0` are resolved automatically.
+Use `apt` (not `dpkg -i`) so that dependencies such as `zenity` are resolved automatically.
 
 ---
 

@@ -381,6 +381,14 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
+To install a release `.deb`:
+
+```bash
+sudo apt install ./fmail-v1.0.0-linux-amd64.deb
+```
+
+Use `apt` (not `dpkg -i`) so that dependencies such as `zenity` and `libsqlite3-0` are resolved automatically.
+
 ---
 
 ## Backup, Restore & Moving Devices
